@@ -1,6 +1,7 @@
 """Async client for Sinergox API."""
 
 import logging
+import types
 from typing import Any, Optional
 
 import httpx
@@ -154,7 +155,7 @@ class Client:
         self,
         exc_type: Optional[type],
         exc_val: Optional[BaseException],
-        exc_tb: Optional[Any],
+        exc_tb: Optional[types.TracebackType],
     ) -> None:
         """Async context manager exit - closes the connection automatically."""
         await self.close()
