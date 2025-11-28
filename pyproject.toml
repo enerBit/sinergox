@@ -3,11 +3,12 @@ name = "sinergox"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "pablete", email = "jtamayoh@gmail.com" }
-]
-requires-python = ">=3.14"
-dependencies = []
+authors = [{ name = "pablete", email = "jtamayoh@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27", "pandas>=2.1", "textdistance>=4.6"]
+
+[dependency-groups]
+dev = ["pytest>=8.2"]
 
 [build-system]
 requires = ["uv_build>=0.9.11,<0.10.0"]

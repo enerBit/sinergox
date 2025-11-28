@@ -1,21 +1,3 @@
-
-# Sinergox API de XM
-
-## Description
-
-Library to easily access Sinergox API data (XM) as tidy data.
-
-## Installation
-
-You can install the development version of Sinergox from GitHub with:
-
-```sh
-uv add sinergox
-```
-
-## Usage
-
-```python
 import asyncio
 import datetime as dt
 
@@ -39,8 +21,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    print("Running sinergox example...")
     asyncio.run(main())
-```
-
-All public methods in `Client` are asynchronous. Either run them inside an async
-function and `await` the result, or use `asyncio.run` as shown above.

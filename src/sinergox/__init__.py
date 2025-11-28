@@ -1,2 +1,7 @@
-def hello() -> str:
-    return "Hello from sinergox!"
+from .client import Client, EntityTypes, Periodo
+
+__all__ = [
+    "Client",
+    "EntityTypes",
+    "Periodo",
+]
