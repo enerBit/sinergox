@@ -1,0 +1,61 @@
+[project]
+name = "sinergox"
+dynamic = ["version"]
+description = "Async client for Sinergox API"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "enerBit", email = "jtamayoh@gmail.com" }]
+keywords = [
+    "sinergox",
+    "async",
+    "client",
+    "api",
+    "energy",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/enerBit/sinergox"
+Repository = "https://github.com/enerBit/sinergox.git"
+
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/sinergox/VERSION"
+pattern = "^(?P<version>.+)$"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sinergox"]
+
+[tool.hatch.build.targets.sdist]
+packages = ["src/sinergox"]
+include = ["/tests"]
+
+[tool.pytest.ini_options]
+pythonpath = "src"
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 119
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["B", "C", "E", "F", "W", "B9", "I"]
+ignore = ["E501"]
