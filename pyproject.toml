@@ -1,6 +1,6 @@
 [project]
 name = "sinergox"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Python client for the Sinergox API (Colombian energy market data)."
 readme = "README.md"
 authors = [{ name = "pablete", email = "jtamayoh@gmail.com" }]
