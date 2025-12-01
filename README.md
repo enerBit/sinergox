@@ -34,8 +34,6 @@ pip install sinergox
 
 ```python
 import asyncio
-from zoneinfo import ZoneInfo
-
 from sinergox import Client
 
 
@@ -44,9 +42,7 @@ async def main() -> None:
         # Descarga los últimos siete días para la primera métrica que coincida
         # con la consulta, asumiendo la zona horaria de Bogotá.
         datos = await client.get_data_for(
-            "VoluUtil",
-            timezone=ZoneInfo("America/Bogota"),
-            days=7,
+            "volumen util",
         )
         print(datos.head())
 

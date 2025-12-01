@@ -1,7 +1,7 @@
 [project]
 name = "sinergox"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Python client for the Sinergox API (Colombian energy market data)."
 readme = "README.md"
 authors = [{ name = "pablete", email = "jtamayoh@gmail.com" }]
 requires-python = ">=3.10"
