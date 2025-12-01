@@ -1,7 +1,7 @@
-from .client import Client, EntityTypes, Periodo
+from .client import Client, Entity, TimeResolution
 
 __all__ = [
     "Client",
-    "EntityTypes",
-    "Periodo",
+    "Entity",
+    "TimeResolution",
 ]

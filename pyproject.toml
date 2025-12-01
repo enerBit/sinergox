@@ -10,6 +10,9 @@ dependencies = ["httpx>=0.27", "pandas>=2.1", "textdistance>=4.6"]
 [dependency-groups]
 dev = ["pytest>=8.2"]
 
+[tool.pytest.ini_options]
+markers = ["integration: tests that hit the live Sinergox API"]
+
 [build-system]
 requires = ["uv_build>=0.9.11,<0.10.0"]
 build-backend = "uv_build"
