@@ -82,8 +82,18 @@ def test_get_data_returns_rows(
         pytest.skip(f"API unavailable: {exc}")
 
     assert not frame.empty
-    assert {"value"}.issubset(frame.columns)
-    assert frame.index.names[:2] == ["MetricName", "Timestamp"]
+    assert frame.index.names[-1] == "Timestamp"
+    entity_names = {entity.value, entity.value.lower()}
+    has_entity_index = any(name in frame.index.names for name in entity_names)
+    assert has_entity_index or frame.index.names == ["Timestamp"]
+    metric_columns = [
+        column for column in frame.columns if column.lower() not in entity_names
+    ]
+    assert metric_columns, "expected at least one metric column"
+    assert all(column != "value" for column in metric_columns)
+    assert all(
+        pd.api.types.is_numeric_dtype(frame[column]) for column in metric_columns
+    )
 
 
 @pytest.mark.integration
@@ -122,8 +132,16 @@ def test_get_data_annual_returns_rows() -> None:
         pytest.skip(f"API unavailable: {exc}")
 
     assert not frame.empty
-    assert {"value"}.issubset(frame.columns)
-    assert frame.index.names[:2] == ["MetricName", "Timestamp"]
+    assert frame.index.names[-1] == "Timestamp"
+    metric_columns = [
+        column
+        for column in frame.columns
+        if column.lower() not in {"metricname", "value"}
+    ]
+    assert metric_columns, "expected at least one metric column"
+    assert all(
+        pd.api.types.is_numeric_dtype(frame[column]) for column in metric_columns
+    )
 
 
 @pytest.mark.integration

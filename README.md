@@ -58,12 +58,13 @@ una corrutina `async` y usa `await`, o encapsula la llamada con `asyncio.run`.
 
 La API incluye un catálogo con más de 150 métricas. Usa `client.find_metric`
 para obtener coincidencias directas y homogéneas, o `client.search_metrics`
-para acceder a la puntuación detallada (nivel de coincidencia, distancia de
-Levenshtein y traslape de tokens). Ejemplo:
+datos = await client.get_data_for(
+    "VoluUtil",
+    timezone=zona,
+    start=dt.datetime(2025, 11, 1, tzinfo=zona),
+    end=dt.datetime(2025, 11, 3, tzinfo=zona),
+)
 
-```python
-resultados = await client.search_metrics("demanda sistema", limit=10)
-print(resultados[["MetricId", "match_tier", "levenshtein"]])
 ```
 
 La búsqueda normaliza acentos y diacríticos, y combina coincidencias exactas
@@ -96,17 +97,28 @@ datos_horarios = await client.get_data(
 Para obtener datos sin revisar manualmente el catálogo, usa
 `client.get_data_for`. La función toma la primera coincidencia de
 `find_metric`, convierte automáticamente la columna `Entity` al `Entity`
-correspondiente y descarga los últimos siete días por defecto.
+correspondiente y, si no indicas un rango temporal, descarga los últimos
+siete días por defecto.
 
 ```python
+import datetime as dt
 from zoneinfo import ZoneInfo
 
+from sinergox import Entity
+
 zona = ZoneInfo("America/Bogota")
-datos = await client.get_data_for("VoluUtil", timezone=zona)
+datos = await client.get_data_for(
+    "VoluUtil",
+    entity=Entity.EMBALSE,
+    timezone=zona,
+    start=dt.datetime(2025, 11, 1, tzinfo=zona),
+    end=dt.datetime(2025, 11, 3, tzinfo=zona),
+)
 ```
 
-Puedes ajustar el número de días, la zona horaria o fijar un `TimeResolution`
-específico a través de los argumentos opcionales.
+Puedes ajustar la zona horaria, definir explícitamente `start` y `end`, fijar
+un `TimeResolution` específico o restringir la búsqueda a una entidad concreta
+mediante los argumentos opcionales.
 
 ## Caché del catálogo de métricas
 

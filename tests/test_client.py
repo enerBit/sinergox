@@ -79,11 +79,11 @@ def test_to_tidy_hourly_produces_expected_columns() -> None:
 
     result = Client._to_tidy(content, DataPath.HORARIO, Entity.RECURSO)
 
-    assert list(result.index.names) == ["MetricName", "Timestamp"]
-    assert {"value", "Recurso", "recurso"}.issubset(result.columns)
+    assert list(result.index.names) == [Entity.RECURSO.value, "Timestamp"]
+    assert {"Sample Metric", "recurso"}.issubset(result.columns)
 
     frame = result.reset_index()
-    assert "level_2" not in frame.columns
+    assert Entity.RECURSO.value.lower() in frame.columns
     assert frame.loc[0, "Timestamp"] == dt.datetime(2025, 1, 1, 0, 0)
     assert frame.loc[1, "Timestamp"] == dt.datetime(2025, 1, 1, 1, 0)
     assert frame[Entity.RECURSO.value].tolist() == ["RecursoA", "RecursoA"]
@@ -91,7 +91,7 @@ def test_to_tidy_hourly_produces_expected_columns() -> None:
         "Recurso Uno",
         "Recurso Uno",
     ]
-    assert frame["value"].tolist() == [10, 20]
+    assert frame["Sample Metric"].tolist() == [10, 20]
 
 
 def test_to_tidy_daily_produces_timestamp_without_hours() -> None:
@@ -114,11 +114,11 @@ def test_to_tidy_daily_produces_timestamp_without_hours() -> None:
 
     result = Client._to_tidy(content, DataPath.DIARIO, Entity.RECURSO)
 
-    assert list(result.index.names) == ["MetricName", "Timestamp"]
+    assert list(result.index.names) == [Entity.RECURSO.value, "Timestamp"]
     frame = result.reset_index()
-    assert "level_2" not in frame.columns
+    assert Entity.RECURSO.value.lower() in frame.columns
     assert frame.loc[0, "Timestamp"] == dt.datetime(2025, 1, 1)
-    assert frame.loc[0, "value"] == 5
+    assert frame.loc[0, "Sample Metric"] == 5
     assert frame.loc[0, Entity.RECURSO.value.lower()] == "Recurso Uno"
 
 
@@ -219,6 +219,33 @@ def test_search_metrics_token_overlap_scores(client: Client) -> None:
     assert results.loc[0, "token_overlap"] > 0
 
 
+def test_search_metrics_prefers_resolution_aliases(client: Client) -> None:
+    sample = pd.DataFrame(
+        [
+            {
+                "MetricId": "GenerRecHoraria",
+                "MetricName": "Generación por recurso",
+                "MetricDescription": "Generación agregada por recurso",
+                "Entity": "Recurso",
+                "Type": "HourlyEntities",
+            },
+            {
+                "MetricId": "GenerRecDiaria",
+                "MetricName": "Generación por recurso",
+                "MetricDescription": "Total diario por recurso",
+                "Entity": "Recurso",
+                "Type": "DailyEntities",
+            },
+        ]
+    )
+    client._metrics_cache = sample
+
+    results = asyncio.run(client.search_metrics("generacion horaria por recurso"))
+
+    assert not results.empty
+    assert results.loc[0, "MetricId"] == "GenerRecHoraria"
+
+
 def test_get_data_for_uses_first_match(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -275,6 +302,195 @@ def test_get_data_for_uses_first_match(
     assert captured["entity"] == Entity.EMBALSE
     assert captured["period"] == TimeResolution.DIARIO
     assert captured["end"] - captured["start"] == dt.timedelta(days=7)
+
+
+def test_get_data_for_explicit_start_defaults_end(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sample = pd.DataFrame(
+        [
+            {
+                "MetricId": "VoluUtilDiarMasa",
+                "MetricName": "Volumen Útil diario por Embalse",
+                "MetricDescription": "Volumen util del embalse en masa",
+                "Entity": "Embalse",
+                "Type": "DailyEntities",
+            }
+        ]
+    )
+    client._metrics_cache = sample
+
+    captured: dict[str, dt.datetime] = {}
+
+    async def fake_get_data(
+        self: Client,
+        period: TimeResolution,
+        *,
+        metric: str,
+        entity: Entity,
+        start: dt.datetime,
+        end: dt.datetime,
+        filter: Sequence[Any] | None = None,
+        concurrency: int | None = None,
+    ) -> pd.DataFrame:
+        captured.update({"start": start, "end": end})
+        return pd.DataFrame({"dummy": [1]})
+
+    monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
+
+    start_input = dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc)
+    asyncio.run(
+        client.get_data_for(
+            "volumen util",
+            timezone=dt.timezone.utc,
+            start=start_input,
+        )
+    )
+
+    assert captured["start"] == dt.datetime(2025, 1, 1)
+    assert captured["end"] - captured["start"] == dt.timedelta(days=7)
+
+
+def test_get_data_for_explicit_end_defaults_start(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sample = pd.DataFrame(
+        [
+            {
+                "MetricId": "VoluUtilDiarMasa",
+                "MetricName": "Volumen Útil diario por Embalse",
+                "MetricDescription": "Volumen util del embalse en masa",
+                "Entity": "Embalse",
+                "Type": "DailyEntities",
+            }
+        ]
+    )
+    client._metrics_cache = sample
+
+    captured: dict[str, dt.datetime] = {}
+
+    async def fake_get_data(
+        self: Client,
+        period: TimeResolution,
+        *,
+        metric: str,
+        entity: Entity,
+        start: dt.datetime,
+        end: dt.datetime,
+        filter: Sequence[Any] | None = None,
+        concurrency: int | None = None,
+    ) -> pd.DataFrame:
+        captured.update({"start": start, "end": end})
+        return pd.DataFrame({"dummy": [1]})
+
+    monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
+
+    end_input = dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc)
+    asyncio.run(
+        client.get_data_for(
+            "volumen util",
+            timezone=dt.timezone.utc,
+            end=end_input,
+        )
+    )
+
+    assert captured["end"] == dt.datetime(2025, 1, 15)
+    assert captured["end"] - captured["start"] == dt.timedelta(days=7)
+
+
+def test_get_data_for_respects_entity_filter(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matches = pd.DataFrame(
+        [
+            {
+                "MetricId": "VoluUtilDiarMasa",
+                "MetricName": "Volumen Útil diario por Embalse",
+                "Entity": "Embalse",
+                "Type": "DailyEntities",
+            },
+            {
+                "MetricId": "GeneracionRecursoHor",
+                "MetricName": "Generación horaria por recurso",
+                "Entity": "Recurso",
+                "Type": "HourlyEntities",
+            },
+        ]
+    )
+
+    async def fake_find_metric(
+        self: Client,
+        query: str,
+        *,
+        levenshtein_threshold: int = 3,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
+        return matches.head(limit or len(matches))
+
+    captured: dict[str, Any] = {}
+
+    async def fake_get_data(
+        self: Client,
+        period: TimeResolution,
+        *,
+        metric: str,
+        entity: Entity,
+        start: dt.datetime,
+        end: dt.datetime,
+        filter: Sequence[Any] | None = None,
+        concurrency: int | None = None,
+    ) -> pd.DataFrame:
+        captured.update({"metric": metric, "entity": entity})
+        return pd.DataFrame({"dummy": [1]})
+
+    monkeypatch.setattr(Client, "find_metric", fake_find_metric, raising=False)
+    monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
+
+    asyncio.run(
+        client.get_data_for(
+            "generacion horaria",
+            entity=Entity.RECURSO,
+            timezone=dt.timezone.utc,
+        )
+    )
+
+    assert captured["metric"] == "GeneracionRecursoHor"
+    assert captured["entity"] == Entity.RECURSO
+
+
+def test_get_data_for_entity_filter_raises_when_missing(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matches = pd.DataFrame(
+        [
+            {
+                "MetricId": "VoluUtilDiarMasa",
+                "MetricName": "Volumen Útil diario por Embalse",
+                "Entity": "Embalse",
+                "Type": "DailyEntities",
+            }
+        ]
+    )
+
+    async def fake_find_metric(
+        self: Client,
+        query: str,
+        *,
+        levenshtein_threshold: int = 3,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
+        return matches.head(limit or len(matches))
+
+    monkeypatch.setattr(Client, "find_metric", fake_find_metric, raising=False)
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            client.get_data_for(
+                "generacion",
+                entity=Entity.RECURSO,
+                timezone=dt.timezone.utc,
+            )
+        )
 
 
 def test_get_data_for_raises_when_no_match(client: Client) -> None:

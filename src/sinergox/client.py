@@ -61,6 +61,12 @@ ENDPOINT_TO_RESOLUTION: dict[DataPath, TimeResolution] = {
 DateLike = dt.datetime | dt.date
 HOUR_PATTERN = re.compile(r"(?P<hour_digits>\d{2})")
 DEFAULT_TIMEZONE = ZoneInfo("America/Bogota")
+RESOLUTION_ALIASES: dict[DataPath, tuple[str, ...]] = {
+    DataPath.HORARIO: ("horario", "horaria", "hourly"),
+    DataPath.DIARIO: ("diario", "diaria", "daily"),
+    DataPath.MENSUAL: ("mensual", "monthly"),
+    DataPath.ANUAL: ("anual", "annual"),
+}
 
 
 class Client:
@@ -259,8 +265,10 @@ class Client:
         self,
         query: str,
         *,
-        days: int = 7,
+        start: DateLike | None = None,
+        end: DateLike | None = None,
         period: TimeResolution | None = None,
+        entity: Entity | None = None,
         timezone: dt.tzinfo | None = DEFAULT_TIMEZONE,
     ) -> pd.DataFrame:
         """Fetch data for the first metric matching ``query``.
@@ -274,10 +282,17 @@ class Client:
         ----------
         query:
             Text that will be sent to :meth:`find_metric`.
-        days:
-            Rolling window size (up to ``now`` in the chosen timezone).
+        start:
+            Optional start of the range. When omitted, defaults to seven days
+            before ``end`` (or now).
+        end:
+            Optional end of the range. When omitted, defaults to seven days
+            after ``start`` (or now if both are missing).
         period:
             Optional override for the inferred :class:`TimeResolution`.
+        entity:
+            When provided, restricts candidate metrics to the specified
+            :class:`Entity` before selecting the first match.
         timezone:
             Datetime timezone used to anchor ``start`` and ``end`` (defaults to
             ``America/Bogota``).
@@ -293,9 +308,18 @@ class Client:
             If no matches are found or if required metadata is missing from the
             catalog entry.
         """
-        matches = await self.find_metric(query, limit=1)
+        limit = 50 if entity is not None else 1
+        matches = await self.find_metric(query, limit=limit)
         if matches.empty:
             raise ValueError(f"No se encontraron métricas para la consulta {query!r}.")
+
+        if entity is not None:
+            matches = matches[matches["Entity"] == entity.value]
+            if matches.empty:
+                raise ValueError(
+                    "No se encontraron métricas que coincidan con la entidad "
+                    f"{entity.value!r}."
+                )
 
         row = matches.iloc[0]
         metric_id = row.get("MetricId")
@@ -308,7 +332,7 @@ class Client:
             )
 
         try:
-            entity = Entity(entity_label)
+            entity_member = Entity(entity_label)
         except ValueError as exc:
             raise ValueError(
                 f"El valor de entidad '{entity_label}' no pertenece a Entity."
@@ -335,15 +359,39 @@ class Client:
                 ) from exc
 
         tz = timezone or DEFAULT_TIMEZONE
-        now = dt.datetime.now(tz)
-        start = now - dt.timedelta(days=days)
+
+        def _normalize(value: DateLike | None) -> dt.datetime | None:
+            if value is None:
+                return None
+            if isinstance(value, dt.datetime):
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=tz)
+                return value.astimezone(tz)
+            if isinstance(value, dt.date):
+                return dt.datetime.combine(value, dt.time()).replace(tzinfo=tz)
+            raise TypeError("start/end must be datetime or date instances")
+
+        start_local = _normalize(start)
+        end_local = _normalize(end)
+
+        if start_local is None and end_local is None:
+            end_local = dt.datetime.now(tz)
+            start_local = end_local - dt.timedelta(days=7)
+        elif start_local is None:
+            assert end_local is not None  # for type checkers
+            start_local = end_local - dt.timedelta(days=7)
+        elif end_local is None:
+            end_local = start_local + dt.timedelta(days=7)
+
+        start_dt = self._ensure_datetime(start_local)
+        end_dt = self._ensure_datetime(end_local)
 
         return await self.get_data(
             resolved_period,
             metric=metric_id,
-            entity=entity,
-            start=start,
-            end=now,
+            entity=entity_member,
+            start=start_dt,
+            end=end_dt,
         )
 
     async def find_metric(
@@ -424,7 +472,20 @@ class Client:
                 row.get("MetricId", ""),
                 row.get("MetricName", ""),
                 row.get("MetricDescription", ""),
+                row.get("Entity", ""),
+                row.get("Type", ""),
+                row.get("Unit", ""),
             ]
+            type_hint = row.get("Type")
+            if isinstance(type_hint, str):
+                try:
+                    data_path = DataPath(type_hint)
+                except ValueError:
+                    data_path = None
+                if data_path is not None:
+                    aliases = " ".join(RESOLUTION_ALIASES.get(data_path, ()))
+                    if aliases:
+                        fields_raw.append(aliases)
             fields_norm = [
                 self._normalize_text(str(value))
                 for value in fields_raw
@@ -634,6 +695,7 @@ class Client:
         if not value_columns:
             return pd.DataFrame()
 
+        metric_name = str(data_reset["MetricName"].iloc[0])
         var_name = "Hour" if data_path is DataPath.HORARIO else "Variable"
         value_col_name = "_value"
         tidy = data_reset.melt(
@@ -643,7 +705,7 @@ class Client:
             value_name=value_col_name,
         )
 
-        tidy.rename(columns={value_col_name: "value"}, inplace=True)
+        tidy.rename(columns={value_col_name: metric_name}, inplace=True)
 
         if data_path is DataPath.HORARIO:
             tidy["Hour"] = tidy["Hour"].astype(int)
@@ -655,10 +717,21 @@ class Client:
             tidy["Timestamp"] = tidy["Date"]
             tidy.drop(columns=["Variable", "Date"], inplace=True, errors="ignore")
 
-        tidy["value"] = pd.to_numeric(tidy["value"], errors="coerce")
-        tidy.sort_values(["MetricName", "Timestamp"], inplace=True)
+        tidy.drop(columns=["MetricName"], inplace=True)
+
+        if metric_name in tidy.columns:
+            tidy[metric_name] = pd.to_numeric(tidy[metric_name], errors="coerce")
+
+        index_components: list[str] = []
+        if entity.value in tidy.columns:
+            index_components.append(entity.value)
+        elif entity.value.lower() in tidy.columns:
+            index_components.append(entity.value.lower())
+        index_components.append("Timestamp")
+
+        tidy.sort_values(index_components, inplace=True)
         tidy.reset_index(drop=True, inplace=True)
-        return tidy.set_index(["MetricName", "Timestamp"])
+        return tidy.set_index(index_components)
 
     @staticmethod
     def _categorise_columns(
