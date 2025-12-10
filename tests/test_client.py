@@ -2,7 +2,7 @@ import asyncio
 import datetime as dt
 from typing import Any, Sequence
 
-import pandas as pd
+import pyarrow as pa
 import pytest
 
 from sinergox import Client, Entity, TimeResolution
@@ -79,19 +79,23 @@ def test_to_tidy_hourly_produces_expected_columns() -> None:
 
     result = Client._to_tidy(content, DataPath.HORARIO, Entity.RECURSO)
 
-    assert list(result.index.names) == [Entity.RECURSO.value, "Timestamp"]
-    assert {"Sample Metric", "recurso"}.issubset(result.columns)
+    cols = result.column_names
+    assert "Timestamp" in cols
+    assert "Sample Metric" in cols
+    assert Entity.RECURSO.value in cols
+    assert Entity.RECURSO.value.lower() in cols
 
-    frame = result.reset_index()
-    assert Entity.RECURSO.value.lower() in frame.columns
-    assert frame.loc[0, "Timestamp"] == dt.datetime(2025, 1, 1, 0, 0)
-    assert frame.loc[1, "Timestamp"] == dt.datetime(2025, 1, 1, 1, 0)
-    assert frame[Entity.RECURSO.value].tolist() == ["RecursoA", "RecursoA"]
-    assert frame[Entity.RECURSO.value.lower()].tolist() == [
-        "Recurso Uno",
-        "Recurso Uno",
-    ]
-    assert frame["Sample Metric"].tolist() == [10, 20]
+    rows = result.to_pylist()
+    # Sort by timestamp to ensure order
+    rows.sort(key=lambda x: x["Timestamp"])
+    
+    assert len(rows) == 2
+    assert rows[0]["Timestamp"] == dt.datetime(2025, 1, 1, 0, 0)
+    assert rows[1]["Timestamp"] == dt.datetime(2025, 1, 1, 1, 0)
+    assert rows[0][Entity.RECURSO.value] == "RecursoA"
+    assert rows[0][Entity.RECURSO.value.lower()] == "Recurso Uno"
+    assert rows[0]["Sample Metric"] == 10.0
+    assert rows[1]["Sample Metric"] == 20.0
 
 
 def test_to_tidy_daily_produces_timestamp_without_hours() -> None:
@@ -114,16 +118,19 @@ def test_to_tidy_daily_produces_timestamp_without_hours() -> None:
 
     result = Client._to_tidy(content, DataPath.DIARIO, Entity.RECURSO)
 
-    assert list(result.index.names) == [Entity.RECURSO.value, "Timestamp"]
-    frame = result.reset_index()
-    assert Entity.RECURSO.value.lower() in frame.columns
-    assert frame.loc[0, "Timestamp"] == dt.datetime(2025, 1, 1)
-    assert frame.loc[0, "Sample Metric"] == 5
-    assert frame.loc[0, Entity.RECURSO.value.lower()] == "Recurso Uno"
+    cols = result.column_names
+    assert "Timestamp" in cols
+    assert "Sample Metric" in cols
+
+    rows = result.to_pylist()
+    assert len(rows) == 1
+    assert rows[0]["Timestamp"] == dt.datetime(2025, 1, 1)
+    assert rows[0]["Sample Metric"] == 5.0
+    assert rows[0][Entity.RECURSO.value.lower()] == "Recurso Uno"
 
 
 def test_find_metric_prefers_exact_matches(client: Client) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -141,13 +148,14 @@ def test_find_metric_prefers_exact_matches(client: Client) -> None:
 
     results = asyncio.run(client.find_metric("VoluUtilDiarMasa"))
 
-    assert not results.empty
-    assert results.loc[0, "MetricId"] == "VoluUtilDiarMasa"
-    assert "match_tier" not in results.columns
+    assert results.num_rows > 0
+    first_row = results.to_pylist()[0]
+    assert first_row["MetricId"] == "VoluUtilDiarMasa"
+    assert "match_tier" not in results.column_names
 
 
 def test_find_metric_handles_accents_and_tokens(client: Client) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -165,13 +173,14 @@ def test_find_metric_handles_accents_and_tokens(client: Client) -> None:
 
     results = asyncio.run(client.find_metric("volumen util embalse", limit=1))
 
-    assert len(results) == 1
-    assert results.loc[0, "MetricId"] == "VoluUtilDiarMasa"
-    assert "match_tier" not in results.columns
+    assert results.num_rows == 1
+    first_row = results.to_pylist()[0]
+    assert first_row["MetricId"] == "VoluUtilDiarMasa"
+    assert "match_tier" not in results.column_names
 
 
 def test_search_metrics_includes_scoring(client: Client) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -189,13 +198,18 @@ def test_search_metrics_includes_scoring(client: Client) -> None:
 
     results = asyncio.run(client.search_metrics("VoluUtilDiarMasa"))
 
-    assert not results.empty
-    assert {"match_tier", "levenshtein", "token_overlap"}.issubset(results.columns)
-    assert results.loc[0, "match_tier"] == 0
+    assert results.num_rows > 0
+    cols = results.column_names
+    assert "match_tier" in cols
+    assert "levenshtein" in cols
+    assert "token_overlap" in cols
+    
+    first_row = results.to_pylist()[0]
+    assert first_row["match_tier"] == 0
 
 
 def test_search_metrics_token_overlap_scores(client: Client) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -213,14 +227,16 @@ def test_search_metrics_token_overlap_scores(client: Client) -> None:
 
     results = asyncio.run(client.search_metrics("volumen util embalse", limit=1))
 
-    assert len(results) == 1
-    assert results.loc[0, "MetricId"] == "VoluUtilDiarMasa"
-    assert results.loc[0, "match_tier"] <= 3
-    assert results.loc[0, "token_overlap"] > 0
+    assert results.num_rows == 1
+    first_row = results.to_pylist()[0]
+    assert first_row["MetricId"] == "VoluUtilDiarMasa"
+    # match_tier <= 3 (exact=0, starts=1, substr=2, overlap=3)
+    assert first_row["match_tier"] <= 3
+    assert first_row["token_overlap"] > 0
 
 
 def test_search_metrics_prefers_resolution_aliases(client: Client) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "GenerRecHoraria",
@@ -242,14 +258,14 @@ def test_search_metrics_prefers_resolution_aliases(client: Client) -> None:
 
     results = asyncio.run(client.search_metrics("generacion horaria por recurso"))
 
-    assert not results.empty
-    assert results.loc[0, "MetricId"] == "GenerRecHoraria"
+    assert results.num_rows > 0
+    assert results.to_pylist()[0]["MetricId"] == "GenerRecHoraria"
 
 
 def test_get_data_for_uses_first_match(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -281,7 +297,7 @@ def test_get_data_for_uses_first_match(
         end: dt.datetime,
         filter: Sequence[Any] | None = None,
         concurrency: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> pa.Table:
         captured.update(
             {
                 "period": period,
@@ -291,13 +307,13 @@ def test_get_data_for_uses_first_match(
                 "end": end,
             }
         )
-        return pd.DataFrame({"value": [1]})
+        return pa.Table.from_pydict({"value": [1]})
 
     monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
 
     result = asyncio.run(client.get_data_for("volumen util", timezone=dt.timezone.utc))
 
-    assert not result.empty
+    assert result.num_rows > 0
     assert captured["metric"] == "VoluUtilDiarMasa"
     assert captured["entity"] == Entity.EMBALSE
     assert captured["period"] == TimeResolution.DIARIO
@@ -307,7 +323,7 @@ def test_get_data_for_uses_first_match(
 def test_get_data_for_explicit_start_defaults_end(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -332,9 +348,9 @@ def test_get_data_for_explicit_start_defaults_end(
         end: dt.datetime,
         filter: Sequence[Any] | None = None,
         concurrency: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> pa.Table:
         captured.update({"start": start, "end": end})
-        return pd.DataFrame({"dummy": [1]})
+        return pa.Table.from_pydict({"dummy": [1]})
 
     monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
 
@@ -354,7 +370,7 @@ def test_get_data_for_explicit_start_defaults_end(
 def test_get_data_for_explicit_end_defaults_start(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sample = pd.DataFrame(
+    sample = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -379,9 +395,9 @@ def test_get_data_for_explicit_end_defaults_start(
         end: dt.datetime,
         filter: Sequence[Any] | None = None,
         concurrency: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> pa.Table:
         captured.update({"start": start, "end": end})
-        return pd.DataFrame({"dummy": [1]})
+        return pa.Table.from_pydict({"dummy": [1]})
 
     monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
 
@@ -401,7 +417,7 @@ def test_get_data_for_explicit_end_defaults_start(
 def test_get_data_for_respects_entity_filter(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    matches = pd.DataFrame(
+    matches = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -424,8 +440,9 @@ def test_get_data_for_respects_entity_filter(
         *,
         levenshtein_threshold: int = 3,
         limit: int | None = None,
-    ) -> pd.DataFrame:
-        return matches.head(limit or len(matches))
+    ) -> pa.Table:
+        # Simplified slicing
+        return matches.slice(0, limit or matches.num_rows)
 
     captured: dict[str, Any] = {}
 
@@ -439,9 +456,9 @@ def test_get_data_for_respects_entity_filter(
         end: dt.datetime,
         filter: Sequence[Any] | None = None,
         concurrency: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> pa.Table:
         captured.update({"metric": metric, "entity": entity})
-        return pd.DataFrame({"dummy": [1]})
+        return pa.Table.from_pydict({"dummy": [1]})
 
     monkeypatch.setattr(Client, "find_metric", fake_find_metric, raising=False)
     monkeypatch.setattr(Client, "get_data", fake_get_data, raising=False)
@@ -461,7 +478,7 @@ def test_get_data_for_respects_entity_filter(
 def test_get_data_for_entity_filter_raises_when_missing(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    matches = pd.DataFrame(
+    matches = pa.Table.from_pylist(
         [
             {
                 "MetricId": "VoluUtilDiarMasa",
@@ -478,8 +495,8 @@ def test_get_data_for_entity_filter_raises_when_missing(
         *,
         levenshtein_threshold: int = 3,
         limit: int | None = None,
-    ) -> pd.DataFrame:
-        return matches.head(limit or len(matches))
+    ) -> pa.Table:
+        return matches.slice(0, limit or matches.num_rows)
 
     monkeypatch.setattr(Client, "find_metric", fake_find_metric, raising=False)
 
@@ -494,7 +511,7 @@ def test_get_data_for_entity_filter_raises_when_missing(
 
 
 def test_get_data_for_raises_when_no_match(client: Client) -> None:
-    client._metrics_cache = pd.DataFrame()
+    client._metrics_cache = pa.Table.from_batches([], schema=pa.schema([]))
 
     with pytest.raises(ValueError):
         asyncio.run(client.get_data_for("no-existe"))

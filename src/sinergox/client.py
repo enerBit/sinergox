@@ -10,7 +10,8 @@ from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 import httpx
-import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class Client:
         timeout: float | httpx.Timeout | None = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
         metrics_cache_ttl: dt.timedelta | None = dt.timedelta(hours=1),
+        return_pandas: bool = False,
     ) -> None:
         """Build a client instance ready to query the API.
 
@@ -99,6 +101,9 @@ class Client:
             Lifetime for the in-memory metric catalog. Use ``None`` to disable
             expiration or any positive :class:`datetime.timedelta` to refresh
             automatically.
+        return_pandas:
+            If True, methods will return pandas.DataFrame objects instead of
+            pyarrow.Table. Requires pandas to be installed.
         """
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
@@ -111,8 +116,26 @@ class Client:
             if metrics_cache_ttl and metrics_cache_ttl > dt.timedelta(0)
             else None
         )
-        self._metrics_cache: pd.DataFrame | None = None
+        self._metrics_cache: pa.Table | None = None
         self._metrics_cache_expires_at: dt.datetime | None = None
+        self._return_pandas = return_pandas
+        
+        if self._return_pandas:
+            try:
+                import pandas as pd
+                self._pandas_module = pd
+            except ImportError as exc:
+                raise ModuleNotFoundError(
+                    "pandas is required when return_pandas=True. "
+                    "Install it with 'pip install sinergox[pandas]'."
+                ) from exc
+        else:
+            self._pandas_module = None
+
+    def _convert_output(self, table: pa.Table) -> Any:
+        if self._return_pandas:
+            return table.to_pandas()
+        return table
 
     async def __aenter__(self) -> "Client":
         """Enter the async context manager returning the client itself."""
@@ -136,7 +159,7 @@ class Client:
         end: DateLike,
         filter: Sequence[Any] | None = None,
         concurrency: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> Any:
         """Download tidy data for a metric/entity pair.
 
         Parameters
@@ -159,7 +182,7 @@ class Client:
 
         Returns
         -------
-        pandas.DataFrame
+        pyarrow.Table | pandas.DataFrame
             Data indexed by metric name and timestamp with value columns ready
             for analysis.
 
@@ -188,7 +211,7 @@ class Client:
 
         async def wrapped_fetch(
             chunk_start: dt.datetime, chunk_end: dt.datetime
-        ) -> pd.DataFrame:
+        ) -> pa.Table:
             if sem is None:
                 return await self._fetch_data(
                     period,
@@ -214,13 +237,28 @@ class Client:
             wrapped_fetch(chunk_start, chunk_end) for chunk_start, chunk_end in ranges
         ]
         results = await asyncio.gather(*tasks)
-        frames = [frame for frame in results if not frame.empty]
+        frames = [frame for frame in results if frame.num_rows > 0]
         if not frames:
-            return pd.DataFrame()
-        combined = pd.concat(frames)
-        return combined.sort_index()
+            return self._convert_output(pa.Table.from_batches([], schema=pa.schema([])))
+        
+        combined = pa.concat_tables(frames)
+        
+        # Sort logic
+        sort_keys = []
+        if entity.value in combined.column_names:
+            sort_keys.append((entity.value, "ascending"))
+        elif entity.value.lower() in combined.column_names:
+             sort_keys.append((entity.value.lower(), "ascending"))
+        
+        if "Timestamp" in combined.column_names:
+            sort_keys.append(("Timestamp", "ascending"))
+            
+        if sort_keys:
+            combined = combined.sort_by(sort_keys)
+            
+        return self._convert_output(combined)
 
-    async def get_metrics(self, *, force_refresh: bool = False) -> pd.DataFrame:
+    async def get_metrics(self, *, force_refresh: bool = False) -> Any:
         """Return the cached metric catalog, refreshing it when required.
 
         Parameters
@@ -230,9 +268,13 @@ class Client:
 
         Returns
         -------
-        pandas.DataFrame
+        pyarrow.Table | pandas.DataFrame
             Catalog with all metadata provided by the API.
         """
+        table = await self._get_metrics_table(force_refresh=force_refresh)
+        return self._convert_output(table)
+
+    async def _get_metrics_table(self, *, force_refresh: bool = False) -> pa.Table:
         now = dt.datetime.now(dt.timezone.utc)
 
         if not force_refresh and self._metrics_cache is not None:
@@ -240,7 +282,7 @@ class Client:
                 self._metrics_cache_expires_at is None
                 or now < self._metrics_cache_expires_at
             ):
-                return self._metrics_cache.copy()
+                return self._metrics_cache
 
         if force_refresh:
             self._metrics_cache = None
@@ -249,17 +291,39 @@ class Client:
         payload = {"MetricId": "ListadoMetricas"}
         content = await self._post("/Lists", json=payload)
         items = content.get("Items", [])
-        metrics = pd.json_normalize(items, "ListEntities", sep=".")
-        metrics.rename(
-            columns={name: name.removeprefix("Values.") for name in metrics.columns},
-            inplace=True,
-        )
+        
+        flat_metrics = []
+        for item in items:
+            for entity_dict in item.get("ListEntities", []):
+                # Flattening: keys are inside "Values" dict usually
+                # The entity_dict might look like {'Id': '...', 'Values': { ... }}
+                values = entity_dict.get("Values", {})
+                if not values:
+                    # Fallback if flattening didn't happen or different structure
+                    # Try to use entity_dict itself if it has the keys
+                    values = entity_dict
+
+                clean_dict = {}
+                for k, v in values.items():
+                    # If keys still have prefixes (unlikely inside Values dict but possible)
+                    key = k.removeprefix("Values.")
+                    clean_dict[key] = v
+                
+                # Also include ID if needed? Pandas normalized it to "Id" maybe?
+                # The test expects MetricId, MetricName which are inside Values.
+                flat_metrics.append(clean_dict)
+        
+        if not flat_metrics:
+            metrics = pa.Table.from_batches([], schema=pa.schema([]))
+        else:
+            metrics = pa.Table.from_pylist(flat_metrics)
+
         self._metrics_cache = metrics
         if self._metrics_cache_ttl is None:
             self._metrics_cache_expires_at = None
         else:
             self._metrics_cache_expires_at = now + self._metrics_cache_ttl
-        return metrics.copy()
+        return metrics
 
     async def get_data_for(
         self,
@@ -270,7 +334,7 @@ class Client:
         period: TimeResolution | None = None,
         entity: Entity | None = None,
         timezone: dt.tzinfo | None = DEFAULT_TIMEZONE,
-    ) -> pd.DataFrame:
+    ) -> Any:
         """Fetch data for the first metric matching ``query``.
 
         This helper combines :meth:`find_metric` and :meth:`get_data`. It picks
@@ -299,7 +363,7 @@ class Client:
 
         Returns
         -------
-        pandas.DataFrame
+        pyarrow.Table | pandas.DataFrame
             Tidy frame for the discovered metric.
 
         Raises
@@ -308,20 +372,48 @@ class Client:
             If no matches are found or if required metadata is missing from the
             catalog entry.
         """
-        limit = 50 if entity is not None else 1
-        matches = await self.find_metric(query, limit=limit)
-        if matches.empty:
+        # Note: we use self.find_metric which might return pandas if configured that way.
+        # But we need PyArrow logic here internally if possible, OR adapt to handle both.
+        # Easier to force pyarrow internally for logic, but self.find_metric obeys global setting.
+        
+        # We can temporarily bypass find_metric or handle both types.
+        # But find_metric calls search_metrics.
+        
+        # Let's handle the return type of find_metric by checking isinstance or converting back if needed is messy.
+        # Better approach: internal methods always return Table/Dict? 
+        # No, find_metric is public.
+        
+        # We can implement a private _find_metric that returns Table and use it.
+        # Or just cast it back if it is DataFrame (inefficient but safe).
+        # Actually since we have full Table in `matches`, we can just use `matches` regardless of type 
+        # if we are careful, but pandas vs pyarrow API is different.
+        
+        # Let's inspect `matches`.
+        matches = await self.find_metric(query, limit=50 if entity is not None else 1)
+        
+        # If matches is DF, convert to Table or use DF API?
+        # Converting back to Table is safest to share logic below.
+        if self._return_pandas:
+             import pandas as pd
+             if isinstance(matches, pd.DataFrame):
+                 matches = pa.Table.from_pandas(matches)
+
+        if matches.num_rows == 0:
             raise ValueError(f"No se encontraron métricas para la consulta {query!r}.")
 
         if entity is not None:
-            matches = matches[matches["Entity"] == entity.value]
-            if matches.empty:
+            # Filter matches by Entity matches["Entity"] == entity.value
+            # Use PyArrow compute
+            mask = pc.equal(matches["Entity"], entity.value)
+            matches = matches.filter(mask)
+            if matches.num_rows == 0:
                 raise ValueError(
                     "No se encontraron métricas que coincidan con la entidad "
                     f"{entity.value!r}."
                 )
 
-        row = matches.iloc[0]
+        # Take the first row
+        row = matches.to_pylist()[0]
         metric_id = row.get("MetricId")
         entity_label = row.get("Entity")
         if not metric_id or not isinstance(metric_id, str):
@@ -400,21 +492,32 @@ class Client:
         *,
         levenshtein_threshold: int = 3,
         limit: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> Any:
         """Convenience wrapper around :meth:`search_metrics`.
 
         Returns the best matches without the scoring columns so that the
         resulting frame is ready for human or agent consumption.
         """
+        # We need the inner search to return Table for our drop_columns logic if possible
+        # Or we call search_metrics (which handles conversion) then convert back? 
+        # Better: check result type
         results = await self.search_metrics(
             query,
             levenshtein_threshold=levenshtein_threshold,
             limit=limit,
         )
-        return results.drop(
-            columns=["match_tier", "levenshtein", "token_overlap"],
-            errors="ignore",
-        )
+        
+        # If Pandas, drop cols using pandas API
+        if self._return_pandas and isinstance(results, self._pandas_module.DataFrame):
+            cols_to_drop = ["match_tier", "levenshtein", "token_overlap"]
+            return results.drop(columns=cols_to_drop, errors="ignore")
+        
+        # PyArrow
+        cols_to_drop = ["match_tier", "levenshtein", "token_overlap"]
+        present_cols = [c for c in cols_to_drop if c in results.column_names]
+        if present_cols:
+            results = results.drop_columns(present_cols)
+        return results
 
     async def search_metrics(
         self,
@@ -422,7 +525,7 @@ class Client:
         *,
         levenshtein_threshold: int = 3,
         limit: int | None = None,
-    ) -> pd.DataFrame:
+    ) -> Any:
         """Return catalog matches enriched with scoring metadata.
 
         Parameters
@@ -437,23 +540,16 @@ class Client:
 
         Returns
         -------
-        pandas.DataFrame
+        pyarrow.Table | pandas.DataFrame
             Catalog records plus ``match_tier``, ``levenshtein`` and
             ``token_overlap`` columns.
-
-        Raises
-        ------
-        ValueError
-            If ``query`` is empty or whitespace.
-        ModuleNotFoundError
-            When the optional dependency ``textdistance`` is missing.
         """
         if not query.strip():
             raise ValueError("query must not be empty")
 
-        metrics = await self.get_metrics()
-        if metrics.empty:
-            return metrics
+        metrics_table = await self._get_metrics_table()
+        if metrics_table.num_rows == 0:
+            return metrics_table
 
         try:
             from textdistance import levenshtein
@@ -467,7 +563,11 @@ class Client:
         query_norm = self._normalize_text(query)
         query_tokens = self._tokenize(query_norm)
 
-        def score_row(row: pd.Series) -> pd.Series:
+        metrics_list = metrics_table.to_pylist()
+        scored_rows = []
+
+        for row in metrics_list:
+            # Score logic
             fields_raw = [
                 row.get("MetricId", ""),
                 row.get("MetricName", ""),
@@ -486,19 +586,19 @@ class Client:
                     aliases = " ".join(RESOLUTION_ALIASES.get(data_path, ()))
                     if aliases:
                         fields_raw.append(aliases)
+            
             fields_norm = [
                 self._normalize_text(str(value))
                 for value in fields_raw
                 if isinstance(value, str) and value
             ]
+
             if not fields_norm:
-                return pd.Series(
-                    {
-                        "match_tier": 5,
-                        "levenshtein": float("inf"),
-                        "token_overlap": 0.0,
-                    }
-                )
+                row["match_tier"] = 5
+                row["levenshtein"] = float("inf")
+                row["token_overlap"] = 0.0
+                scored_rows.append(row)
+                continue
 
             best_lev = min(levenshtein(field, query_norm) for field in fields_norm)
 
@@ -526,33 +626,40 @@ class Client:
             elif token_overlap > 0:
                 tier = 3
 
-            return pd.Series(
-                {
-                    "match_tier": tier,
-                    "levenshtein": best_lev,
-                    "token_overlap": token_overlap,
-                }
-            )
+            row["match_tier"] = tier
+            row["levenshtein"] = best_lev
+            row["token_overlap"] = token_overlap
+            scored_rows.append(row)
 
-        scores = metrics.apply(score_row, axis=1)
-        ranked = pd.concat([metrics, scores], axis=1)
-
+        # Filtering
         threshold = (
             levenshtein_threshold if levenshtein_threshold is not None else float("inf")
         )
-        mask = (ranked["match_tier"] < 4) | (ranked["levenshtein"] <= threshold)
-        matches = ranked.loc[mask]
-        if matches.empty:
-            return matches.reset_index(drop=True)
+        
+        filtered_rows = [
+            r for r in scored_rows 
+            if r["match_tier"] < 4 or r["levenshtein"] <= threshold
+        ]
 
-        matches = matches.sort_values(
-            by=["match_tier", "levenshtein", "token_overlap", "MetricName"],
-            ascending=[True, True, False, True],
-        )
+        if not filtered_rows:
+             # Return empty table with correct schema (including scoring columns)
+             # Simplest way is to infer from the list if not empty, but it is empty.
+             # We can create a dummy dict with all keys from metrics + scoring keys
+             schema_keys = metrics_table.column_names + ["match_tier", "levenshtein", "token_overlap"]
+             return pa.Table.from_batches([], schema=pa.schema([(k, pa.string()) for k in schema_keys])) # Approx schema
+
+        # Sorting: match_tier (asc), levenshtein (asc), token_overlap (desc), MetricName (asc)
+        # Python sort is stable. We sort in reverse order of significance
+        
+        filtered_rows.sort(key=lambda x: x.get("MetricName", ""))
+        filtered_rows.sort(key=lambda x: x.get("token_overlap", 0.0), reverse=True)
+        filtered_rows.sort(key=lambda x: x.get("levenshtein", float("inf")))
+        filtered_rows.sort(key=lambda x: x.get("match_tier", 5))
+
         if limit is not None:
-            matches = matches.head(limit)
-
-        return matches.reset_index(drop=True)
+            filtered_rows = filtered_rows[:limit]
+            
+        return self._convert_output(pa.Table.from_pylist(filtered_rows))
 
     async def _fetch_data(
         self,
@@ -564,7 +671,7 @@ class Client:
         end: dt.datetime,
         data_path: DataPath,
         filter: Sequence[Any] | None,
-    ) -> pd.DataFrame:
+    ) -> pa.Table:
         body: dict[str, Any] = {
             "MetricId": metric_id,
             "StartDate": self._serialize_date(start),
@@ -627,137 +734,122 @@ class Client:
         content: dict[str, Any],
         data_path: DataPath,
         entity: Entity,
-    ) -> pd.DataFrame:
-        prepared = Client._prepare_frame(content, data_path, entity)
-        if prepared.empty:
-            return prepared
-        return Client._reshape_frame(prepared, data_path, entity)
-
-    @staticmethod
-    def _prepare_frame(
-        content: dict[str, Any],
-        data_path: DataPath,
-        entity: Entity,
-    ) -> pd.DataFrame:
+    ) -> pa.Table:
+        """Parses JSON content directly into a Tidy PyArrow Table."""
         metric_name = content.get("Metric", {}).get("Name", "Unknown Metric")
         items = content.get("Items", [])
         if not items:
-            return pd.DataFrame()
+            return pa.Table.from_batches([], schema=pa.schema([]))
 
-        data = pd.json_normalize(
-            items, record_path=[data_path.value], sep="-", meta=["Date"]
-        )
-        data["MetricName"] = metric_name
-        data["Date"] = pd.to_datetime(data["Date"], format="%Y-%m-%d")
-
+        rows = []
+        
+        # Prepare lookup keys
         code_keys = ["Values-code", "Values-Code", "Code"]
-        for key in code_keys:
-            if key in data.columns:
-                data.rename(columns={key: entity.value}, inplace=True)
-                break
-
         name_keys = ["Values-name", "Values-Name", "Name"]
-        for key in name_keys:
-            if key in data.columns:
-                data.rename(columns={key: entity.value.lower()}, inplace=True)
-                break
+        value_keys_lower = ["values-value", "value"]
 
-        if "Values-value" in data.columns:
-            data.rename(columns={"Values-value": "value"}, inplace=True)
-
-        if "Id" in data.columns:
-            data = data.drop(columns=["Id"])
-
-        if data_path is DataPath.HORARIO:
-            column_map = {
-                column: int(match.group("hour_digits"))
-                for column in data.columns
-                if isinstance(column, str) and (match := HOUR_PATTERN.search(column))
-            }
-            if column_map:
-                data = data.rename(columns=column_map)
-
-        data = data.set_index(["MetricName", "Date"], drop=True)
-        return data
-
-    @staticmethod
-    def _reshape_frame(
-        data: pd.DataFrame,
-        data_path: DataPath,
-        entity: Entity,
-    ) -> pd.DataFrame:
-        data_reset = data.reset_index()
-        index_columns = ["MetricName", "Date"]
-
-        value_columns, metadata_columns = Client._categorise_columns(
-            data_reset.columns, index_columns, data_path
-        )
-        if not value_columns:
-            return pd.DataFrame()
-
-        metric_name = str(data_reset["MetricName"].iloc[0])
-        var_name = "Hour" if data_path is DataPath.HORARIO else "Variable"
-        value_col_name = "_value"
-        tidy = data_reset.melt(
-            id_vars=index_columns + metadata_columns,
-            value_vars=value_columns,
-            var_name=var_name,
-            value_name=value_col_name,
-        )
-
-        tidy.rename(columns={value_col_name: metric_name}, inplace=True)
-
-        if data_path is DataPath.HORARIO:
-            tidy["Hour"] = tidy["Hour"].astype(int)
-            tidy["Timestamp"] = tidy["Date"] + pd.to_timedelta(
-                tidy["Hour"] - 1, unit="h"
-            )
-            tidy.drop(columns=["Hour", "Date"], inplace=True)
-        else:
-            tidy["Timestamp"] = tidy["Date"]
-            tidy.drop(columns=["Variable", "Date"], inplace=True, errors="ignore")
-
-        tidy.drop(columns=["MetricName"], inplace=True)
-
-        if metric_name in tidy.columns:
-            tidy[metric_name] = pd.to_numeric(tidy[metric_name], errors="coerce")
-
-        index_components: list[str] = []
-        if entity.value in tidy.columns:
-            index_components.append(entity.value)
-        elif entity.value.lower() in tidy.columns:
-            index_components.append(entity.value.lower())
-        index_components.append("Timestamp")
-
-        tidy.sort_values(index_components, inplace=True)
-        tidy.reset_index(drop=True, inplace=True)
-        return tidy.set_index(index_components)
-
-    @staticmethod
-    def _categorise_columns(
-        columns: Sequence[Any],
-        index_columns: Sequence[str],
-        data_path: DataPath,
-    ) -> tuple[list[Any], list[str]]:
-        value_columns: list[Any] = []
-        metadata_columns: list[str] = []
-        for column in columns:
-            if column in index_columns:
+        for item in items:
+            date_str = item.get("Date")
+            if not date_str:
                 continue
-            if Client._is_value_column(column, data_path):
-                value_columns.append(column)
-            else:
-                metadata_columns.append(column)  # type: ignore[arg-type]
-        return value_columns, metadata_columns
+            # Parse date once
+            try:
+                 base_date = dt.datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                 continue
 
-    @staticmethod
-    def _is_value_column(column: Any, data_path: DataPath) -> bool:
-        if data_path is DataPath.HORARIO:
-            return isinstance(column, int)
-        if isinstance(column, str):
-            lowered = column.lower()
-            return lowered == "value" or lowered.endswith("value")
-        return False
+            entity_records = item.get(data_path.value, [])
+            for record in entity_records:
+                # The record might be {'Id': '...', 'Values': { 'code': ..., 'val': ... }}
+                # We need to look inside 'Values' or assume flattened keys if they exist
+                
+                # Check for explicit Values dict
+                # Some endpoints might flatten it differently, but debug shows nested Values
+                vals = record.get("Values", {})
+                
+                # Merge top level keys (excluding Values) with vals to mimic flattening
+                # but careful about overwrites.
+                # Actually we mainly care about what's in Values for code/name/metrics.
+                # But 'Id' is at top level.
+                
+                # Build a combined lookup dict
+                # Keys inside Values usually don't have "Values-" prefix in raw JSON, 
+                # but pandas with sep="-" would create "Values-code".
+                # My logic below checks for "Values-code" OR "Code".
+                # If we use `vals` dict, the key is just "code".
+                
+                combined = record.copy()
+                if "Values" in combined:
+                    del combined["Values"]
+                # Add vals keys. If we want to support "Values-code" style lookup, 
+                # we can rely on "code" checking.
+                combined.update(vals)
+
+                # Identify Entity Code and Name
+                entity_code = None
+                # Check for "code", "Code", "Values-code" (if flattened upstream)
+                for k in ["code", "Code", "Values-code", "Values-Code"]:
+                    if k in combined:
+                        entity_code = combined[k]
+                        break
+                
+                entity_name = None
+                for k in ["name", "Name", "Values-name", "Values-Name"]:
+                     if k in combined:
+                         entity_name = combined[k]
+                         break
+                
+                if data_path == DataPath.HORARIO:
+                     for k, v in combined.items():
+                         # Check for hour pattern in key
+                         match = HOUR_PATTERN.search(k)
+                         if match:
+                             hour = int(match.group("hour_digits"))
+                             val = v
+                             
+                             # Construct Timestamp
+                             # date + (hour - 1) hours
+                             ts = base_date + dt.timedelta(hours=hour - 1)
+                             
+                             row = {
+                                 "Timestamp": ts,
+                                 metric_name: float(val) if val is not None else None
+                             }
+                             if entity_code is not None:
+                                 row[entity.value] = entity_code
+                             if entity_name is not None:
+                                 row[entity.value.lower()] = entity_name
+                             
+                             rows.append(row)
+                else:
+                    # Daily or others
+                    val = None
+                    found_value = False
+                    # Check combined keys
+                    for k, v in combined.items():
+                         lowered = k.lower()
+                         # "value" or "values-value"
+                         if lowered == "value" or lowered == "values-value" or lowered.endswith("value"):
+                             val = v
+                             found_value = True
+                             break
+                    
+                    if found_value:
+                        row = {
+                             "Timestamp": base_date,
+                             metric_name: float(val) if val is not None else None
+                        }
+                        if entity_code is not None:
+                             row[entity.value] = entity_code
+                        if entity_name is not None:
+                             row[entity.value.lower()] = entity_name
+                        rows.append(row)
+
+        if not rows:
+             return pa.Table.from_batches([], schema=pa.schema([]))
+
+        return pa.Table.from_pylist(rows)
+
 
     @staticmethod
     def _normalize_text(value: str) -> str:
